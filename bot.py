@@ -15,7 +15,7 @@ from telegram.ext import (
     filters,
 )
 
-app = Flask(name)
+app = Flask(shit)
 
 @app.route("/")
 def home():
