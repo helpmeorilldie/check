@@ -1,4 +1,3 @@
-
 import os
 import sys
 import asyncio
@@ -37,7 +36,7 @@ MAX_LOG_CHARS = 3500
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
 logger = logging.getLogger(__name__)
@@ -51,12 +50,12 @@ web_app = Flask(__name__)
 
 @web_app.route("/")
 def home():
-    return "Telegram bot is running!", 200
+    return "write whatever u want or create a web page❗️😼", 200
 
 
 @web_app.route("/health")
 def health():
-    return {"status": "ok"}, 200
+    return "OK", 200
 
 
 def run_web_server():
@@ -81,11 +80,9 @@ log_buffer = deque(maxlen=200)
 output_task = None
 log_task = None
 
-process_lock = None
-
 
 # ==========================================
-# ACCESS CONTROL
+# ADMIN ACCESS
 # ==========================================
 
 def is_admin(update: Update) -> bool:
@@ -108,19 +105,16 @@ async def deny_access(update: Update):
 # SCRIPT UTILITIES
 # ==========================================
 
-def list_approved_scripts():
+def get_approved_scripts():
     return sorted(
-        path for path in SCRIPT_DIR.glob("*.py")
+        path
+        for path in SCRIPT_DIR.glob("*.py")
         if path.is_file()
     )
 
 
-def active_process():
-    return process is not None and process.returncode is None
-
-
 # ==========================================
-# START / HELP
+# START
 # ==========================================
 
 async def start(
@@ -133,17 +127,17 @@ async def start(
 
     await update.effective_message.reply_text(
         "🐍 Python Script Manager\n\n"
-        "/run <filename.py> - Run an approved script\n"
         "/scripts - List approved scripts\n"
+        "/run <filename.py> - Run an approved script\n"
         "/logs - View recent output\n"
         "/stop - Stop the running script\n"
         "/cancel - Cancel the current operation\n\n"
-        "Only scripts stored in approved_scripts/ can run."
+        "Web health endpoint: /health"
     )
 
 
 # ==========================================
-# LIST APPROVED SCRIPTS
+# LIST SCRIPTS
 # ==========================================
 
 async def scripts_command(
@@ -154,12 +148,12 @@ async def scripts_command(
         await deny_access(update)
         return
 
-    scripts = list_approved_scripts()
+    scripts = get_approved_scripts()
 
     if not scripts:
         await update.effective_message.reply_text(
-            "📂 No approved scripts found.\n\n"
-            "Add reviewed .py files to the approved_scripts directory."
+            "📂 No approved scripts found.\n"
+            "Add reviewed .py files to approved_scripts/."
         )
         return
 
@@ -178,32 +172,28 @@ async def run_command(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     global process, current_script, current_chat_id
-    global output_task, log_task, process_lock
+    global output_task, log_task
 
     if not is_admin(update):
         await deny_access(update)
         return
 
-    if process_lock is None:
-        process_lock = asyncio.Lock()
-
     if not context.args:
         await update.effective_message.reply_text(
-            "Usage: /run filename.py\n\n"
+            "Usage: /run filename.py\n"
             "Use /scripts to list approved scripts."
         )
         return
 
     filename = context.args[0]
 
-    # Only accept a plain filename, not a path.
     if (
         Path(filename).name != filename
         or not filename.endswith(".py")
         or filename in ("", ".", "..")
     ):
         await update.effective_message.reply_text(
-            "❌ Please provide a valid approved .py filename."
+            "❌ Invalid filename."
         )
         return
 
@@ -211,62 +201,60 @@ async def run_command(
 
     if not script_path.is_file():
         await update.effective_message.reply_text(
-            "❌ That script is not in approved_scripts/."
+            "❌ Script not found in approved_scripts/."
         )
         return
 
-    async with process_lock:
-        if active_process():
-            await update.effective_message.reply_text(
-                "⚠️ A script is already running. Use /stop first."
-            )
-            return
-
-        log_buffer.clear()
-        current_script = filename
-        current_chat_id = update.effective_chat.id
-
-        try:
-            process = await asyncio.create_subprocess_exec(
-                sys.executable,
-                "-u",
-                str(script_path),
-                cwd=str(SCRIPT_DIR),
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-        except Exception:
-            logger.exception("Could not start approved script")
-            process = None
-            await update.effective_message.reply_text(
-                "❌ Could not start the script. Check Render logs."
-            )
-            return
-
-        child = process
-
-        log_buffer.append(
-            f"Started: {filename}\n"
-            f"PID: {child.pid}\n"
-        )
-
+    if process is not None and process.returncode is None:
         await update.effective_message.reply_text(
-            f"🚀 Running: {filename}\n"
-            "📋 Output updates arrive approximately every 10 seconds.\n"
-            "⌨️ Send normal text to provide input.\n"
-            "🛑 Use /stop to stop the script."
+            "⚠️ A script is already running. Use /stop first."
         )
+        return
 
-        output_task = asyncio.create_task(collect_output(child))
-        log_task = asyncio.create_task(
-            send_periodic_logs(
-                context.application,
-                current_chat_id,
-                child,
-                filename,
-            )
+    log_buffer.clear()
+    current_script = filename
+    current_chat_id = update.effective_chat.id
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-u",
+            str(script_path),
+            cwd=str(SCRIPT_DIR),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
         )
+    except Exception:
+        logger.exception("Could not start script")
+        process = None
+        await update.effective_message.reply_text(
+            "❌ Could not start script. Check Render logs."
+        )
+        return
+
+    child = process
+
+    log_buffer.append(
+        f"Started: {filename}\nPID: {child.pid}\n"
+    )
+
+    await update.effective_message.reply_text(
+        f"🚀 Running: {filename}\n"
+        "📋 Logs update approximately every 10 seconds.\n"
+        "⌨️ Send normal text to provide input.\n"
+        "🛑 Use /stop to stop the script."
+    )
+
+    output_task = asyncio.create_task(collect_output(child))
+    log_task = asyncio.create_task(
+        send_periodic_logs(
+            context.application,
+            current_chat_id,
+            child,
+            filename,
+        )
+    )
 
 
 # ==========================================
@@ -277,11 +265,13 @@ async def collect_output(child):
     try:
         while True:
             chunk = await child.stdout.read(1024)
+
             if not chunk:
                 break
 
-            text = chunk.decode("utf-8", errors="replace")
-            log_buffer.append(text)
+            log_buffer.append(
+                chunk.decode("utf-8", errors="replace")
+            )
 
     except asyncio.CancelledError:
         raise
@@ -290,7 +280,7 @@ async def collect_output(child):
 
 
 # ==========================================
-# SEND PERIODIC LOGS
+# PERIODIC LOGS
 # ==========================================
 
 async def send_periodic_logs(
@@ -314,14 +304,13 @@ async def send_periodic_logs(
                         text=f"📋 Logs — {filename}\n\n{output}",
                     )
                 except Exception:
-                    logger.exception("Could not send periodic logs")
+                    logger.exception("Could not send logs")
 
             if child.returncode is not None:
                 break
 
         await child.wait()
 
-        # Ensure all remaining output has been collected.
         if output_task and not output_task.done():
             await output_task
 
@@ -329,20 +318,19 @@ async def send_periodic_logs(
         if not output:
             output = "(No output produced.)"
 
-        try:
-            await application.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"🏁 Script finished: {filename}\n"
-                    f"Exit code: {child.returncode}\n\n"
-                    f"📋 Final output:\n{output}"
-                ),
-            )
-        except Exception:
-            logger.exception("Could not send final logs")
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"🏁 Finished: {filename}\n"
+                f"Exit code: {child.returncode}\n\n"
+                f"📋 Final output:\n{output}"
+            ),
+        )
 
     except asyncio.CancelledError:
         raise
+    except Exception:
+        logger.exception("Log delivery failed")
     finally:
         if process is child:
             process = None
@@ -367,11 +355,12 @@ async def provide_input(
 
     if child.stdin is None:
         await update.effective_message.reply_text(
-            "This process does not accept input."
+            "This script does not accept input."
         )
         return
 
     text = update.effective_message.text
+
     if not text:
         return
 
@@ -406,9 +395,9 @@ async def logs_command(
         )
         return
 
-    output = "".join(log_buffer)[-MAX_LOG_CHARS:]
     await update.effective_message.reply_text(
-        f"📋 Recent output\n\n{output}"
+        "📋 Recent output\n\n"
+        + "".join(log_buffer)[-MAX_LOG_CHARS:]
     )
 
 
@@ -420,6 +409,8 @@ async def stop_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    global process
+
     if not is_admin(update):
         await deny_access(update)
         return
@@ -442,7 +433,7 @@ async def stop_command(
             await child.wait()
 
         await update.effective_message.reply_text(
-            "🛑 Stop signal sent."
+            "🛑 Script stopped."
         )
 
     except ProcessLookupError:
@@ -464,7 +455,7 @@ async def cancel_command(
         return
 
     await update.effective_message.reply_text(
-        "No pending operation. Use /run <filename.py> to start an approved script."
+        "No pending operation. Use /run <filename.py> to run an approved script."
     )
 
 
@@ -485,19 +476,25 @@ async def error_handler(
 
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("Set BOT_TOKEN in Render environment variables.")
+        raise RuntimeError(
+            "Set BOT_TOKEN in Render environment variables."
+        )
 
     if ADMIN_ID == 0:
-        raise RuntimeError("Set ADMIN_ID in Render environment variables.")
+        raise RuntimeError(
+            "Set ADMIN_ID in Render environment variables."
+        )
 
-    # Start the Flask server in the background.
-    Thread(target=run_web_server, daemon=True).start()
+    Thread(
+        target=run_web_server,
+        daemon=True,
+    ).start()
 
     telegram_app = Application.builder().token(BOT_TOKEN).build()
 
     telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(CommandHandler("run", run_command))
     telegram_app.add_handler(CommandHandler("scripts", scripts_command))
+    telegram_app.add_handler(CommandHandler("run", run_command))
     telegram_app.add_handler(CommandHandler("logs", logs_command))
     telegram_app.add_handler(CommandHandler("stop", stop_command))
     telegram_app.add_handler(CommandHandler("cancel", cancel_command))
