@@ -1,11 +1,8 @@
 import os
 import sys
 import asyncio
-from flask import Flask 
-from threading import Thread
 from pathlib import Path
 from collections import deque
-
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -14,24 +11,38 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from flask import Flask
+from threading import Thread
 
 app = Flask(__name__)
+
 
 @app.route("/")
 def home():
     return "write whatever u want or create a web page❗️😼", 200
 
+
 @app.route("/health")
 def health():
     return "OK", 200
 
+
 def run():
-    app.run(host="0.0.0.0", port=10000)
+    app.run(
+        host="0.0.0.0",
+        port=10000,
+        use_reloader=False
+    )
+
 
 def keep_alive():
     server = Thread(target=run, daemon=True)
     server.start()
+
+
 keep_alive()
+
+
 # ==========================================
 # CONFIGURATION
 # ==========================================
