@@ -1,190 +1,427 @@
 import os
-import time
+import sys
 import asyncio
-import subprocess
 from pathlib import Path
+from collections import deque
 
-import requests
 from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_ID = int(os.environ["ADMIN_ID"])
+# ==========================================
+# CONFIGURATION
+# ==========================================
 
-SCRIPT_DIR = Path("approved_scripts").resolve()
-SCRIPT_DIR.mkdir(exist_ok=True)
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
+SCRIPT_DIR = Path("uploaded_scripts").resolve()
+SCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+
+MAX_FILE_SIZE = 100 * 1024
+LOG_INTERVAL = 10
+
+# Runtime state
+awaiting_upload = set()
 process = None
-log_file = None
-last_position = 0
+current_script = None
+log_buffer = deque(maxlen=200)
+log_task = None
+process_lock = asyncio.Lock()
 
 
-def is_admin(update):
+# ==========================================
+# ACCESS CONTROL
+# ==========================================
+
+def is_admin(update: Update) -> bool:
     return (
         update.effective_user is not None
         and update.effective_user.id == ADMIN_ID
+        and ADMIN_ID != 0
     )
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def deny_access(update: Update):
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "⛔ You are not authorized to use this bot."
+        )
+
+
+# ==========================================
+# COMMANDS
+# ==========================================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     if not is_admin(update):
+        await deny_access(update)
         return
 
-    await update.message.reply_text(
-        "Python Script Manager\n\n"
-        "/run filename.py - Run an approved script\n"
-        "/logs - View recent logs\n"
-        "/stop - Stop the running script"
+    await update.effective_message.reply_text(
+        "🐍 Python Script Manager\n\n"
+        "/run - Upload a Python script\n"
+        "/logs - View recent output\n"
+        "/stop - Stop the running script\n"
+        "/cancel - Cancel an upload\n\n"
+        "Send /run, then upload your .py file."
     )
 
 
-async def run_script(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global process, log_file, last_position
+async def run_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_admin(update):
+        await deny_access(update)
+        return
+
+    awaiting_upload.add(update.effective_user.id)
+
+    await update.effective_message.reply_text(
+        "📂 Upload your Python file now.\n\n"
+        "Only .py files are accepted.\n"
+        "Maximum file size: 100 KB.\n\n"
+        "⚠️ Only upload scripts you trust."
+    )
+
+
+async def cancel_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_admin(update):
+        await deny_access(update)
+        return
+
+    awaiting_upload.discard(update.effective_user.id)
+
+    await update.effective_message.reply_text(
+        "Upload cancelled."
+    )
+
+
+# ==========================================
+# FILE UPLOAD
+# ==========================================
+
+async def receive_file(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    global process
 
     if not is_admin(update):
+        await deny_access(update)
         return
 
-    if not context.args:
-        await update.message.reply_text(
-            "Usage: /run filename.py"
+    user_id = update.effective_user.id
+
+    if user_id not in awaiting_upload:
+        await update.effective_message.reply_text(
+            "Send /run first, then upload your .py file."
         )
         return
 
-    filename = context.args[0]
+    document = update.effective_message.document
 
-    # Only allow a filename, not an arbitrary filesystem path.
-    if (
-        Path(filename).name != filename
-        or not filename.endswith(".py")
-    ):
-        await update.message.reply_text("Invalid filename.")
+    if not document:
         return
 
-    script_path = (SCRIPT_DIR / filename).resolve()
+    filename = document.file_name or ""
 
-    if script_path.parent != SCRIPT_DIR or not script_path.is_file():
-        await update.message.reply_text(
-            "That script is not in the approved_scripts folder."
+    if not filename.lower().endswith(".py"):
+        await update.effective_message.reply_text(
+            "❌ Please upload a Python (.py) file."
         )
         return
 
-    if process is not None and process.poll() is None:
-        await update.message.reply_text(
-            "A script is already running. Use /stop first."
+    if document.file_size > MAX_FILE_SIZE:
+        await update.effective_message.reply_text(
+            "❌ File too large. Maximum size is 100 KB."
         )
         return
 
-    log_path = SCRIPT_DIR / "latest.log"
-    log_file = open(log_path, "w", encoding="utf-8")
-    last_position = 0
+    # Use a generated filename instead of trusting the uploaded path.
+    safe_name = Path(filename).name
 
-    process = subprocess.Popen(
-        ["python3", "-u", str(script_path)],
-        cwd=str(SCRIPT_DIR),
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        shell=False,
+    if safe_name in ("", ".", ".."):
+        await update.effective_message.reply_text(
+            "Invalid filename."
+        )
+        return
+
+    async with process_lock:
+        if process is not None and process.returncode is None:
+            await update.effective_message.reply_text(
+                "⚠️ A script is already running. Use /stop first."
+            )
+            return
+
+        destination = SCRIPT_DIR / safe_name
+
+        try:
+            telegram_file = await document.get_file()
+            await telegram_file.download_to_drive(
+                custom_path=str(destination)
+            )
+        except Exception as exc:
+            await update.effective_message.reply_text(
+                f"❌ Upload failed: {exc}"
+            )
+            return
+
+        awaiting_upload.discard(user_id)
+
+        await update.effective_message.reply_text(
+            f"✅ File received: {safe_name}\n"
+            "📂 Saved successfully.\n"
+            "▶️ Starting script..."
+        )
+
+        await start_script(
+            update,
+            context,
+            destination,
+        )
+
+
+# ==========================================
+# SCRIPT EXECUTION
+# ==========================================
+
+async def start_script(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    script_path: Path,
+):
+    global process, current_script, log_task
+
+    if process is not None and process.returncode is None:
+        await update.effective_message.reply_text(
+            "A script is already running."
+        )
+        return
+
+    log_buffer.clear()
+    current_script = script_path.name
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-u",
+            str(script_path),
+            cwd=str(SCRIPT_DIR),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+    except Exception as exc:
+        process = None
+        await update.effective_message.reply_text(
+            f"❌ Could not start script: {exc}"
+        )
+        return
+
+    log_buffer.append(
+        f"Started {current_script}\n"
+        f"Process ID: {process.pid}\n"
+    )
+
+    log_task = asyncio.create_task(
+        collect_output(process)
     )
 
     context.application.create_task(
-        send_logs_periodically(
+        send_periodic_logs(
             context.application,
             update.effective_chat.id,
             process,
-            log_path,
         )
     )
 
-    await update.message.reply_text(
-        f"Started {filename}.\n"
-        "Logs will be sent every 10 seconds."
-    )
+
+async def collect_output(child):
+    """Read output continuously to prevent the pipe from filling."""
+    try:
+        while True:
+            line = await child.stdout.readline()
+
+            if not line:
+                break
+
+            text = line.decode(
+                "utf-8",
+                errors="replace",
+            ).rstrip()
+
+            if text:
+                log_buffer.append(text)
+
+    except Exception as exc:
+        log_buffer.append(f"Log reader error: {exc}")
 
 
-async def send_logs_periodically(app, chat_id, child, log_path):
-    global last_position, log_file
+async def send_periodic_logs(
+    application,
+    chat_id: int,
+    child,
+):
+    """Send accumulated output every 10 seconds."""
+    while child.returncode is None:
+        await asyncio.sleep(LOG_INTERVAL)
 
-    while child.poll() is None:
-        await asyncio.sleep(10)
+        if log_buffer:
+            output = "\n".join(log_buffer)
+            output = output[-3500:]
 
-        try:
-            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-                f.seek(last_position)
-                output = f.read()
-                last_position = f.tell()
-
-            if output.strip():
-                # Telegram messages have a size limit.
-                output = output[-3500:]
-                await app.bot.send_message(
+            try:
+                await application.bot.send_message(
                     chat_id=chat_id,
-                    text=f"Latest logs:\n\n{output}",
+                    text=f"📋 Logs — {current_script}\n\n{output}",
                 )
-        except Exception:
-            pass
+            except Exception:
+                pass
+
+        if child.returncode is None:
+            # Refresh the return code after each interval.
+            await child.wait()
+
+    if log_buffer:
+        output = "\n".join(log_buffer)[-3500:]
+    else:
+        output = "(No output produced.)"
 
     try:
-        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-            output = f.read()[-3500:]
-
-        await app.bot.send_message(
+        await application.bot.send_message(
             chat_id=chat_id,
             text=(
-                f"Script finished. Exit code: {child.returncode}\n\n"
-                f"Final logs:\n{output or '(no output)'}"
+                f"🏁 Script finished: {current_script}\n"
+                f"Exit code: {child.returncode}\n\n"
+                f"📋 Final output:\n{output}"
             ),
         )
     except Exception:
         pass
 
-    if log_file:
-        log_file.close()
-        log_file = None
 
+# ==========================================
+# VIEW LOGS
+# ==========================================
 
-async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def logs_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     if not is_admin(update):
+        await deny_access(update)
         return
 
-    log_path = SCRIPT_DIR / "latest.log"
-
-    if not log_path.exists():
-        await update.message.reply_text("No logs found.")
+    if not log_buffer:
+        await update.effective_message.reply_text(
+            "No script logs available yet."
+        )
         return
 
-    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-        output = f.read()[-3500:]
+    output = "\n".join(log_buffer)[-3500:]
 
-    await update.message.reply_text(output or "The log is empty.")
+    await update.effective_message.reply_text(
+        f"📋 Recent logs\n\n{output}"
+    )
 
 
-async def stop_script(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ==========================================
+# STOP SCRIPT
+# ==========================================
+
+async def stop_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     global process
 
     if not is_admin(update):
+        await deny_access(update)
         return
 
-    if process is not None and process.poll() is None:
-        process.terminate()
-        await update.message.reply_text("Stop signal sent.")
-    else:
-        await update.message.reply_text("No script is currently running.")
+    child = process
 
+    if child is None or child.returncode is not None:
+        await update.effective_message.reply_text(
+            "No script is currently running."
+        )
+        return
+
+    child.terminate()
+
+    try:
+        await asyncio.wait_for(
+            child.wait(),
+            timeout=5,
+        )
+    except asyncio.TimeoutError:
+        child.kill()
+        await child.wait()
+
+    await update.effective_message.reply_text(
+        "🛑 Stop signal sent. The script has stopped."
+    )
+
+
+# ==========================================
+# ERROR HANDLER
+# ==========================================
+
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    print(f"Telegram bot error: {context.error}")
+
+
+# ==========================================
+# MAIN
+# ==========================================
 
 def main():
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "Set the BOT_TOKEN environment variable."
+        )
+
+    if ADMIN_ID == 0:
+        raise RuntimeError(
+            "Set ADMIN_ID to your Telegram numeric user ID."
+        )
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("run", run_script))
-    app.add_handler(CommandHandler("logs", logs))
-    app.add_handler(CommandHandler("stop", stop_script))
+    app.add_handler(CommandHandler("run", run_command))
+    app.add_handler(CommandHandler("logs", logs_command))
+    app.add_handler(CommandHandler("stop", stop_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
 
+    app.add_handler(
+        MessageHandler(
+            filters.Document.ALL,
+            receive_file,
+        )
+    )
+
+    app.add_error_handler(error_handler)
+
+    print("Python Script Manager is running.")
     app.run_polling()
 
 
 if __name__ == "__main__":
     main()
+
