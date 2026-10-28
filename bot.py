@@ -1,6 +1,8 @@
 import os
 import sys
 import asyncio
+from flask import Flask 
+from threading import Thread
 from pathlib import Path
 from collections import deque
 
@@ -13,6 +15,23 @@ from telegram.ext import (
     filters,
 )
 
+app = Flask(name)
+
+@app.route("/")
+def home():
+    return "write whatever u want or create a web page❗️😼", 200
+
+@app.route("/health")
+def health():
+    return "OK", 200
+
+def run():
+    app.run(host="0.0.0.0", port=10000)
+
+def keep_alive():
+    server = Thread(target=run, daemon=True)
+    server.start()
+keep_alive()
 # ==========================================
 # CONFIGURATION
 # ==========================================
