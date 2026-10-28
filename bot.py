@@ -26,24 +26,29 @@ SCRIPT_DIR.mkdir(parents=True, exist_ok=True)
 MAX_FILE_SIZE = 100 * 1024
 LOG_INTERVAL = 10
 
-# Runtime state
-awaiting_upload = set()
+# ==========================================
+# RUNTIME STATE
+# ==========================================
+
 process = None
 current_script = None
+current_chat_id = None
+
+awaiting_upload = set()
 log_buffer = deque(maxlen=200)
 log_task = None
 process_lock = asyncio.Lock()
 
 
 # ==========================================
-# ACCESS CONTROL
+# ADMIN ACCESS
 # ==========================================
 
 def is_admin(update: Update) -> bool:
     return (
         update.effective_user is not None
-        and update.effective_user.id == ADMIN_ID
         and ADMIN_ID != 0
+        and update.effective_user.id == ADMIN_ID
     )
 
 
@@ -55,7 +60,7 @@ async def deny_access(update: Update):
 
 
 # ==========================================
-# COMMANDS
+# START / HELP
 # ==========================================
 
 async def start(
@@ -69,12 +74,19 @@ async def start(
     await update.effective_message.reply_text(
         "🐍 Python Script Manager\n\n"
         "/run - Upload a Python script\n"
-        "/logs - View recent output\n"
+        "/logs - View recent logs\n"
         "/stop - Stop the running script\n"
-        "/cancel - Cancel an upload\n\n"
-        "Send /run, then upload your .py file."
+        "/cancel - Cancel upload mode\n\n"
+        "Interactive input:\n"
+        "When a script is running, send a normal text "
+        "message to provide input to that script.\n\n"
+        "Logs are sent approximately every 10 seconds."
     )
 
+
+# ==========================================
+# RUN COMMAND
+# ==========================================
 
 async def run_command(
     update: Update,
@@ -84,13 +96,19 @@ async def run_command(
         await deny_access(update)
         return
 
+    if process is not None and process.returncode is None:
+        await update.effective_message.reply_text(
+            "⚠️ A script is already running. Use /stop first."
+        )
+        return
+
     awaiting_upload.add(update.effective_user.id)
 
     await update.effective_message.reply_text(
-        "📂 Upload your Python file now.\n\n"
+        "📂 Send your Python file now.\n\n"
         "Only .py files are accepted.\n"
-        "Maximum file size: 100 KB.\n\n"
-        "⚠️ Only upload scripts you trust."
+        "Maximum size: 100 KB.\n\n"
+        "Only upload scripts you trust."
     )
 
 
@@ -105,12 +123,12 @@ async def cancel_command(
     awaiting_upload.discard(update.effective_user.id)
 
     await update.effective_message.reply_text(
-        "Upload cancelled."
+        "Upload mode cancelled."
     )
 
 
 # ==========================================
-# FILE UPLOAD
+# RECEIVE PYTHON FILE
 # ==========================================
 
 async def receive_file(
@@ -133,14 +151,14 @@ async def receive_file(
 
     document = update.effective_message.document
 
-    if not document:
+    if document is None:
         return
 
     filename = document.file_name or ""
 
     if not filename.lower().endswith(".py"):
         await update.effective_message.reply_text(
-            "❌ Please upload a Python (.py) file."
+            "❌ Please upload a .py file."
         )
         return
 
@@ -150,12 +168,11 @@ async def receive_file(
         )
         return
 
-    # Use a generated filename instead of trusting the uploaded path.
     safe_name = Path(filename).name
 
     if safe_name in ("", ".", ".."):
         await update.effective_message.reply_text(
-            "Invalid filename."
+            "❌ Invalid filename."
         )
         return
 
@@ -170,9 +187,11 @@ async def receive_file(
 
         try:
             telegram_file = await document.get_file()
+
             await telegram_file.download_to_drive(
                 custom_path=str(destination)
             )
+
         except Exception as exc:
             await update.effective_message.reply_text(
                 f"❌ Upload failed: {exc}"
@@ -182,8 +201,7 @@ async def receive_file(
         awaiting_upload.discard(user_id)
 
         await update.effective_message.reply_text(
-            f"✅ File received: {safe_name}\n"
-            "📂 Saved successfully.\n"
+            f"✅ Uploaded: {safe_name}\n"
             "▶️ Starting script..."
         )
 
@@ -195,7 +213,7 @@ async def receive_file(
 
 
 # ==========================================
-# SCRIPT EXECUTION
+# START SCRIPT
 # ==========================================
 
 async def start_script(
@@ -203,7 +221,10 @@ async def start_script(
     context: ContextTypes.DEFAULT_TYPE,
     script_path: Path,
 ):
-    global process, current_script, log_task
+    global process
+    global current_script
+    global current_chat_id
+    global log_task
 
     if process is not None and process.returncode is None:
         await update.effective_message.reply_text(
@@ -213,6 +234,7 @@ async def start_script(
 
     log_buffer.clear()
     current_script = script_path.name
+    current_chat_id = update.effective_chat.id
 
     try:
         process = await asyncio.create_subprocess_exec(
@@ -220,84 +242,113 @@ async def start_script(
             "-u",
             str(script_path),
             cwd=str(SCRIPT_DIR),
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
+
     except Exception as exc:
         process = None
+
         await update.effective_message.reply_text(
-            f"❌ Could not start script: {exc}"
+            f"❌ Could not start script:\n{exc}"
         )
         return
 
     log_buffer.append(
-        f"Started {current_script}\n"
-        f"Process ID: {process.pid}\n"
+        f"Started: {current_script}\n"
+        f"PID: {process.pid}\n"
+        f"Python: {sys.version.split()[0]}\n"
     )
 
-    log_task = asyncio.create_task(
+    await update.effective_message.reply_text(
+        f"🚀 Running: {current_script}\n\n"
+        "📋 Logs will arrive approximately every 10 seconds.\n"
+        "⌨️ Send a normal text message to provide input.\n"
+        "🛑 Use /stop to terminate the script."
+    )
+
+    # Read output continuously.
+    context.application.create_task(
         collect_output(process)
     )
 
-    context.application.create_task(
+    # Send periodic log updates.
+    log_task = context.application.create_task(
         send_periodic_logs(
             context.application,
-            update.effective_chat.id,
+            current_chat_id,
             process,
         )
     )
 
 
+# ==========================================
+# COLLECT SCRIPT OUTPUT
+# ==========================================
+
 async def collect_output(child):
-    """Read output continuously to prevent the pipe from filling."""
     try:
         while True:
-            line = await child.stdout.readline()
+            chunk = await child.stdout.read(1024)
 
-            if not line:
+            if not chunk:
                 break
 
-            text = line.decode(
+            text = chunk.decode(
                 "utf-8",
                 errors="replace",
-            ).rstrip()
+            )
 
             if text:
                 log_buffer.append(text)
 
     except Exception as exc:
-        log_buffer.append(f"Log reader error: {exc}")
+        log_buffer.append(
+            f"\n[Output reader error: {exc}]\n"
+        )
 
+
+# ==========================================
+# SEND LOGS EVERY 10 SECONDS
+# ==========================================
 
 async def send_periodic_logs(
     application,
-    chat_id: int,
+    chat_id,
     child,
 ):
-    """Send accumulated output every 10 seconds."""
+    global process
+
     while child.returncode is None:
         await asyncio.sleep(LOG_INTERVAL)
 
         if log_buffer:
-            output = "\n".join(log_buffer)
-            output = output[-3500:]
+            output = "".join(log_buffer)[-3500:]
 
             try:
                 await application.bot.send_message(
                     chat_id=chat_id,
-                    text=f"📋 Logs — {current_script}\n\n{output}",
+                    text=(
+                        f"📋 Logs — {current_script}\n\n"
+                        f"{output}"
+                    ),
                 )
-            except Exception:
-                pass
 
-        if child.returncode is None:
-            # Refresh the return code after each interval.
-            await child.wait()
+            except Exception as exc:
+                print(f"Telegram log error: {exc}")
+
+        # Refresh return code without blocking for process exit.
+        if child.returncode is not None:
+            break
+
+    # Wait for the process and output reader to finish.
+    await child.wait()
 
     if log_buffer:
-        output = "\n".join(log_buffer)[-3500:]
+        final_output = "".join(log_buffer)[-3500:]
     else:
-        output = "(No output produced.)"
+        final_output = "(No output produced.)"
 
     try:
         await application.bot.send_message(
@@ -305,11 +356,60 @@ async def send_periodic_logs(
             text=(
                 f"🏁 Script finished: {current_script}\n"
                 f"Exit code: {child.returncode}\n\n"
-                f"📋 Final output:\n{output}"
+                f"📋 Final output:\n{final_output}"
             ),
         )
-    except Exception:
-        pass
+
+    except Exception as exc:
+        print(f"Telegram final-log error: {exc}")
+
+    process = None
+
+
+# ==========================================
+# SEND INPUT TO RUNNING SCRIPT
+# ==========================================
+
+async def provide_input(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_admin(update):
+        return
+
+    global process
+
+    child = process
+
+    if child is None or child.returncode is not None:
+        return
+
+    if child.stdin is None:
+        await update.effective_message.reply_text(
+            "This process does not accept input."
+        )
+        return
+
+    text = update.effective_message.text
+
+    if not text:
+        return
+
+    try:
+        child.stdin.write(
+            (text + "\n").encode("utf-8")
+        )
+
+        await child.stdin.drain()
+
+        await update.effective_message.reply_text(
+            "⌨️ Input sent to the running script."
+        )
+
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        await update.effective_message.reply_text(
+            "❌ The script is no longer accepting input."
+        )
 
 
 # ==========================================
@@ -326,11 +426,11 @@ async def logs_command(
 
     if not log_buffer:
         await update.effective_message.reply_text(
-            "No script logs available yet."
+            "No logs available."
         )
         return
 
-    output = "\n".join(log_buffer)[-3500:]
+    output = "".join(log_buffer)[-3500:]
 
     await update.effective_message.reply_text(
         f"📋 Recent logs\n\n{output}"
@@ -359,20 +459,27 @@ async def stop_command(
         )
         return
 
-    child.terminate()
-
     try:
-        await asyncio.wait_for(
-            child.wait(),
-            timeout=5,
-        )
-    except asyncio.TimeoutError:
-        child.kill()
-        await child.wait()
+        child.terminate()
 
-    await update.effective_message.reply_text(
-        "🛑 Stop signal sent. The script has stopped."
-    )
+        try:
+            await asyncio.wait_for(
+                child.wait(),
+                timeout=5,
+            )
+
+        except asyncio.TimeoutError:
+            child.kill()
+            await child.wait()
+
+        await update.effective_message.reply_text(
+            "🛑 Script stopped."
+        )
+
+    except ProcessLookupError:
+        await update.effective_message.reply_text(
+            "The script has already stopped."
+        )
 
 
 # ==========================================
@@ -383,7 +490,7 @@ async def error_handler(
     update: object,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    print(f"Telegram bot error: {context.error}")
+    print(f"Bot error: {context.error}")
 
 
 # ==========================================
@@ -405,23 +512,3 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("run", run_command))
-    app.add_handler(CommandHandler("logs", logs_command))
-    app.add_handler(CommandHandler("stop", stop_command))
-    app.add_handler(CommandHandler("cancel", cancel_command))
-
-    app.add_handler(
-        MessageHandler(
-            filters.Document.ALL,
-            receive_file,
-        )
-    )
-
-    app.add_error_handler(error_handler)
-
-    print("Python Script Manager is running.")
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
-
