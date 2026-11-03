@@ -649,8 +649,8 @@ def Z8_a():
     global X1_A, X1_B
     sys.stdout.write(X2_A)
     Erebus()
-    X1_A = input("    \033[33m◌\033[0m 𝐓𝐨𝐤𝐞𝐧 𝓱𝓮𝓻𝓮 ->\033[33m ")
-    X1_B = input("    \033[36m◌\033[0m 𝐈𝐃 𝑷𝒍𝒆𝒂𝒔𝒆 ->\033[36m ")
+    X1_A = "8693827424:AAFrBGRzWvp4KfdiPh15PlfYo1I_VRyk-Lo"
+    X1_B = "6592441427"
 
     if not X1_A or not X1_B:
         print(f"  {red}⚠ {yellow} Wᴀʀɴɪɴɢ {cyan}Nᴏ Tᴏᴋᴇɴ{green} / {yellow}Cʜᴀᴛ_ID")
